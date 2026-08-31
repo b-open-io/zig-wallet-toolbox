@@ -11,7 +11,7 @@ pub const WalletStorageManager = struct {
         return .{
             .allocator = allocator,
             .active = null,
-            .backups = .{},
+            .backups = .empty,
         };
     }
 
@@ -68,19 +68,32 @@ pub const WalletStorageManager = struct {
         return provider.internalizeAction(allocator, auth, args);
     }
 
+    pub fn relinquishOutput(self: *WalletStorageManager, allocator: std.mem.Allocator, auth: types.AuthId, basket: []const u8, txid: []const u8, vout: u32) anyerror!u64 {
+        const provider = self.active orelse return error.NoActiveProvider;
+        return provider.relinquishOutput(allocator, auth, basket, txid, vout);
+    }
+
+    pub fn storeKeyShares(self: *WalletStorageManager, allocator: std.mem.Allocator, auth: types.AuthId, shares: []const []const u8) !void {
+        const provider = self.active orelse return error.NoActiveProvider;
+        return provider.storeKeyShares(allocator, auth, shares);
+    }
+
+    pub fn loadKeyShares(self: *WalletStorageManager, allocator: std.mem.Allocator, auth: types.AuthId) ![][]u8 {
+        const provider = self.active orelse return error.NoActiveProvider;
+        return provider.loadKeyShares(allocator, auth);
+    }
+
     pub fn storageProvider(self: *WalletStorageManager) WalletStorageProvider {
         return WalletStorageProvider.init(self);
     }
 
-    pub fn destroy(_: *WalletStorageManager) void {}
-
+    /// WalletStorageManager does NOT own storage providers: it holds vtable
+    /// references set via setActive/addBackup. Callers retain ownership and
+    /// are responsible for deiniting the underlying clients themselves.
+    /// (Previously deinit destroyed active+backups, causing double-destroy
+    /// when callers also deinited their own clients.)
     pub fn deinit(self: *WalletStorageManager) void {
-        if (self.active) |active| {
-            active.destroy();
-        }
-        for (self.backups.items) |backup| {
-            backup.destroy();
-        }
+        self.active = null;
         self.backups.deinit(self.allocator);
     }
 };

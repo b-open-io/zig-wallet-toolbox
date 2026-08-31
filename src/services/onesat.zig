@@ -1,5 +1,7 @@
 const std = @import("std");
+const bsvz = @import("bsvz");
 const types = @import("types.zig");
+const util = @import("../util.zig");
 const WalletServices = @import("interface.zig").WalletServices;
 const ChaintracksClient = @import("chaintracks.zig").ChaintracksClient;
 const BeefClient = @import("beef.zig").BeefClient;
@@ -22,7 +24,7 @@ pub const OneSatServices = struct {
     const testnet_host = "https://testnet.api.1sat.app";
     const service_name = "1sat-api";
 
-    pub fn init(allocator: std.mem.Allocator, chain: Chain, host: ?[]const u8) OneSatServices {
+    pub fn init(allocator: std.mem.Allocator, chain: Chain, host: ?[]const u8, io: std.Io) OneSatServices {
         const h = host orelse switch (chain) {
             .main => mainnet_host,
             .@"test" => testnet_host,
@@ -33,10 +35,10 @@ pub const OneSatServices = struct {
             .host = h,
             .host_owned = owned,
             .chain = chain,
-            .chaintracks = ChaintracksClient.init(allocator, h),
-            .beef = BeefClient.init(allocator, h),
-            .arcade = ArcadeClient.init(allocator, h),
-            .txo = TxoClient.init(allocator, h),
+            .chaintracks = ChaintracksClient.init(allocator, io, h),
+            .beef = BeefClient.init(allocator, io, h),
+            .arcade = ArcadeClient.init(allocator, io, h),
+            .txo = TxoClient.init(allocator, io, h),
         };
     }
 
@@ -59,7 +61,8 @@ pub const OneSatServices = struct {
     // --- WalletServices vtable methods ---
 
     pub fn getMerklePath(self: *OneSatServices, allocator: std.mem.Allocator, txid: []const u8) !types.MerklePathResult {
-        const proof_bytes = self.beef.getProof(txid) catch {
+        const proof_bytes = self.beef.getProof(txid) catch |err| {
+            std.log.warn("getMerklePath: failed to get proof for {s}: {s}", .{ txid, @errorName(err) });
             return .{
                 .name = service_name,
                 .merkle_path = null,
@@ -67,21 +70,41 @@ pub const OneSatServices = struct {
             };
         };
 
-        // Parse block height from the proof binary (BRC-10 MerklePath format):
-        // The first 4 bytes after a varint blockHeight.
-        // For now, return proof bytes directly; block header lookup requires parsing blockHeight.
-        // TODO: Parse blockHeight from merkle path binary to fetch the corresponding header.
-        _ = allocator;
+        // Parse the proof (BRC-10 MerklePath binary) to extract the block
+        // height, then fetch the corresponding header from chaintracks.
+        var block_header: ?types.MerklePathBlockHeader = null;
+        if (bsvz.spv.MerklePath.parse(allocator, proof_bytes)) |path| {
+            var mp = path;
+            defer mp.deinit(allocator);
+
+            if (self.chaintracks.findHeaderForHeight(mp.block_height) catch null) |header| {
+                // Heap-allocate the hex fields: MerklePathBlockHeader holds
+                // slices, so stack buffers would dangle after return.
+                const root_hex = try allocator.alloc(u8, 64);
+                const hash_hex = try allocator.alloc(u8, 64);
+                _ = try bsvz.primitives.hex.encodeLower(&header.merkle_root, root_hex);
+                _ = try bsvz.primitives.hex.encodeLower(&header.hash, hash_hex);
+                block_header = .{
+                    .height = mp.block_height,
+                    .merkle_root = root_hex,
+                    .hash = hash_hex,
+                };
+            }
+        } else |parse_err| {
+            std.log.warn("getMerklePath: proof for {s} is not a parseable BRC-10 merkle path ({s}); returning raw proof only", .{ txid, @errorName(parse_err) });
+        }
+
         return .{
             .name = service_name,
             .merkle_path = proof_bytes,
-            .block_header = null,
+            .block_header = block_header,
         };
     }
 
     pub fn getRawTx(self: *OneSatServices, allocator: std.mem.Allocator, txid: []const u8) !types.RawTxResult {
         _ = allocator;
-        const raw = self.beef.getRawTx(txid) catch {
+        const raw = self.beef.getRawTx(txid) catch |err| {
+            std.log.warn("getRawTx: failed to get raw tx for {s}: {s}", .{ txid, @errorName(err) });
             return .{
                 .txid = txid,
                 .name = service_name,
@@ -148,8 +171,7 @@ pub const OneSatServices = struct {
         return results.toOwnedSlice(allocator);
     }
 
-    pub fn getBeefForTxid(self: *OneSatServices, allocator: std.mem.Allocator, txid: []const u8) ![]u8 {
-        _ = allocator;
+    pub fn getBeefForTxid(self: *OneSatServices, _: std.mem.Allocator, txid: []const u8) ![]u8 {
         return self.beef.getBeef(txid);
     }
 
@@ -175,37 +197,34 @@ pub const OneSatServices = struct {
     }
 
     fn getStatusForSingleTxid(self: *OneSatServices, txid: []const u8, current_height: *?u32) !types.TxStatusDetail {
-        // Try Arcade first
-        if (self.arcade.getStatus(txid)) |status| {
-            switch (status.tx_status) {
-                .MINED, .IMMUTABLE => {
-                    if (current_height.* == null) {
-                        current_height.* = try self.chaintracks.currentHeight();
-                    }
-                    const depth = if (status.block_height) |bh|
-                        current_height.*.? - bh + 1
-                    else
-                        1;
-                    return .{ .txid = txid, .depth = depth, .status = .mined };
-                },
-                .SEEN_ON_NETWORK, .ACCEPTED_BY_NETWORK, .SENT_TO_NETWORK, .RECEIVED => {
-                    return .{ .txid = txid, .depth = 0, .status = .known };
-                },
-                else => {},
-            }
-        } else |_| {}
-
-        // Fall back to beef storage
-        _ = self.beef.getBeef(txid) catch {
+        // The 1Sat API has no per-txid status endpoint; presence in BEEF
+        // storage is the documented way to check whether a tx is known.
+        _ = current_height;
+        const beef_bytes = self.beef.getBeef(txid) catch |err| {
+            std.log.warn("getStatusForSingleTxid: failed to get beef for {s}: {s}", .{ txid, @errorName(err) });
             return .{ .txid = txid, .depth = null, .status = .unknown };
         };
-        // If beef returned data, tx is at least known.
-        // TODO: Parse BEEF to check for merkle proof (mined) vs no proof (known).
+        defer self.allocator.free(beef_bytes);
+
+        // Parse the BEEF: if the tx has an associated merkle proof (bump),
+        // it is mined; a tx present without a proof is merely known.
+        var parsed = bsvz.transaction.beef.newBeefFromBytes(self.allocator, beef_bytes) catch {
+            // Unparseable BEEF still proves the tx is known to the service.
+            return .{ .txid = txid, .depth = 0, .status = .known };
+        };
+        defer parsed.deinit();
+
+        if (parsed.findBump(txid)) |_| {
+            // Mined: a merkle path (bump) exists for this txid.
+            return .{ .txid = txid, .depth = 0, .status = .mined };
+        }
+
         return .{ .txid = txid, .depth = 0, .status = .known };
     }
 
     pub fn getUtxoStatus(self: *OneSatServices, allocator: std.mem.Allocator, outpoint: []const u8) !types.UtxoStatusResult {
-        const txo_result = self.txo.get(outpoint, .{ .sats = true, .spend = true, .block = true }) catch {
+        const txo_result = self.txo.get(outpoint, .{}) catch |err| {
+            std.log.warn("getUtxoStatus: failed to get txo for {s}: {s}", .{ outpoint, @errorName(err) });
             return .{
                 .name = service_name,
                 .status = .success,
@@ -271,8 +290,8 @@ pub const OneSatServices = struct {
         const block_limit: u32 = 500_000_000;
 
         if (n_lock_time >= block_limit) {
-            const now: u64 = @intCast(std.time.timestamp());
-            return n_lock_time < @as(u32, @intCast(now));
+            const now = util.nowSecs();
+            return n_lock_time < now;
         }
 
         const height = try self.chaintracks.currentHeight();

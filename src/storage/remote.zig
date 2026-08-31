@@ -45,7 +45,12 @@ pub const RemoteStorageClient = struct {
         }
 
         if (parsed.result) |result| {
-            return result;
+            // The result borrows memory from the parse arena (`parsed`), which
+            // is freed below. Deep-copy it into the caller's allocator so the
+            // returned value is fully owned and independently freeable.
+            const owned = try json_rpc.deepCopyValue(allocator, result);
+            parsed.deinit();
+            return owned;
         }
 
         parsed.deinit();
@@ -53,12 +58,35 @@ pub const RemoteStorageClient = struct {
     }
 
     fn buildAuthJson(self: *RemoteStorageClient, auth: types.AuthId) !std.json.Value {
-        var obj = std.json.ObjectMap.init(self.allocator);
-        try obj.put("identityKey", .{ .string = auth.identity_key });
+        var obj = try std.json.ObjectMap.init(self.allocator, &[_][]const u8{}, &[_]std.json.Value{});
+        try obj.put(self.allocator, "identityKey", .{ .string = auth.identity_key });
         if (auth.storage_identity_key) |sik| {
-            try obj.put("storageIdentityKey", .{ .string = sik });
+            try obj.put(self.allocator, "storageIdentityKey", .{ .string = sik });
         }
         return .{ .object = obj };
+    }
+
+    /// Free a value previously returned by one of the RPC-backed methods
+    /// (makeAvailable/findOrInsertUser/…): deep-copied results own all their
+    /// memory in `allocator`, and this releases it. Callers no longer need an
+    /// arena or page_allocator workaround for RPC results.
+    pub fn freeResult(self: *RemoteStorageClient, allocator: std.mem.Allocator, value: std.json.Value) void {
+        switch (value) {
+            .string => |s| allocator.free(s),
+            .array => |arr| {
+                for (arr.items) |item| self.freeResult(allocator, item);
+                var arr_mut = arr; arr_mut.deinit();
+            },
+            .object => |obj| {
+                var it = obj.iterator();
+                while (it.next()) |entry| {
+                    allocator.free(entry.key_ptr.*);
+                    self.freeResult(allocator, entry.value_ptr.*);
+                }
+                var obj_mut = obj; obj_mut.deinit(allocator);
+            },
+            else => {},
+        }
     }
 
     pub fn makeAvailable(self: *RemoteStorageClient, allocator: std.mem.Allocator) anyerror!std.json.Value {
@@ -139,6 +167,58 @@ pub const RemoteStorageClient = struct {
         try params.array.append(args);
 
         return self.rpcCall(allocator, "internalizeAction", params);
+    }
+
+    /// relinquishOutput is a WalletStorageWriter RPC method in the TS/Go SDKs;
+    /// the server returns the number of affected outputs.
+    pub fn relinquishOutput(self: *RemoteStorageClient, allocator: std.mem.Allocator, auth: types.AuthId, basket: []const u8, txid: []const u8, vout: u32) anyerror!u64 {
+        var params = std.json.Value{ .array = std.json.Array.init(self.allocator) };
+        defer params.array.deinit();
+        try params.array.append(try self.buildAuthJson(auth));
+
+        var args = try std.json.ObjectMap.init(self.allocator, &[_][]const u8{}, &[_]std.json.Value{});
+        try args.put(self.allocator, "basket", .{ .string = basket });
+        const output = try std.fmt.allocPrint(self.allocator, "{s}.{d}", .{ txid, vout });
+        defer self.allocator.free(output);
+        try args.put(self.allocator, "output", .{ .string = output });
+        try params.array.append(.{ .object = args });
+
+        const result = try self.rpcCall(allocator, "relinquishOutput", params);
+        return switch (result) {
+            .integer => |i| @intCast(i),
+            else => 0,
+        };
+    }
+
+    pub fn storeKeyShares(self: *RemoteStorageClient, allocator: std.mem.Allocator, auth: types.AuthId, shares: []const []const u8) anyerror!void {
+        var params = std.json.Value{ .array = std.json.Array.init(self.allocator) };
+        defer params.array.deinit();
+        try params.array.append(try self.buildAuthJson(auth));
+
+        var arr = std.json.Array.init(self.allocator);
+        defer arr.deinit();
+        for (shares) |s| {
+            try arr.append(.{ .string = s });
+        }
+        try params.array.append(.{ .array = arr });
+
+        _ = try self.rpcCall(allocator, "storeKeyShares", params);
+    }
+
+    pub fn loadKeyShares(self: *RemoteStorageClient, allocator: std.mem.Allocator, auth: types.AuthId) anyerror![][]u8 {
+        var params = std.json.Value{ .array = std.json.Array.init(self.allocator) };
+        defer params.array.deinit();
+        try params.array.append(try self.buildAuthJson(auth));
+
+        const result = try self.rpcCall(allocator, "loadKeyShares", params);
+        const arr = if (result == .array) result.array.items else return error.InvalidResponse;
+        var out = try allocator.alloc([]u8, arr.len);
+        errdefer allocator.free(out);
+        for (arr, 0..) |item, i| {
+            if (item != .string) return error.InvalidResponse;
+            out[i] = try allocator.dupe(u8, item.string);
+        }
+        return out;
     }
 
     pub fn destroy(_: *RemoteStorageClient) void {}

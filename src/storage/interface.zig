@@ -15,6 +15,9 @@ pub const WalletStorageProvider = struct {
         listOutputs: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, auth: types.AuthId, args: std.json.Value) anyerror!std.json.Value,
         listActions: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, auth: types.AuthId, args: std.json.Value) anyerror!std.json.Value,
         internalizeAction: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, auth: types.AuthId, args: std.json.Value) anyerror!std.json.Value,
+        relinquishOutput: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, auth: types.AuthId, basket: []const u8, txid: []const u8, vout: u32) anyerror!u64,
+        storeKeyShares: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, auth: types.AuthId, shares: []const []const u8) anyerror!void,
+        loadKeyShares: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, auth: types.AuthId) anyerror![][]u8,
         destroy: *const fn (ptr: *anyopaque) void,
     };
 
@@ -52,6 +55,21 @@ pub const WalletStorageProvider = struct {
 
     pub fn internalizeAction(self: WalletStorageProvider, allocator: std.mem.Allocator, auth: types.AuthId, args: std.json.Value) !std.json.Value {
         return self.vtable.internalizeAction(self.ptr, allocator, auth, args);
+    }
+
+    /// Remove an output from its basket (stops tracking without spending).
+    /// `txid` is the display-order hex txid; `vout` the output index.
+    /// Returns the number of affected outputs (0 or 1).
+    pub fn relinquishOutput(self: WalletStorageProvider, allocator: std.mem.Allocator, auth: types.AuthId, basket: []const u8, txid: []const u8, vout: u32) !u64 {
+        return self.vtable.relinquishOutput(self.ptr, allocator, auth, basket, txid, vout);
+    }
+
+    pub fn storeKeyShares(self: WalletStorageProvider, allocator: std.mem.Allocator, auth: types.AuthId, shares: []const []const u8) !void {
+        return self.vtable.storeKeyShares(self.ptr, allocator, auth, shares);
+    }
+
+    pub fn loadKeyShares(self: WalletStorageProvider, allocator: std.mem.Allocator, auth: types.AuthId) ![][]u8 {
+        return self.vtable.loadKeyShares(self.ptr, allocator, auth);
     }
 
     pub fn destroy(self: WalletStorageProvider) void {
@@ -97,6 +115,18 @@ pub const WalletStorageProvider = struct {
                 const self: Ptr = @ptrCast(@alignCast(p));
                 return self.internalizeAction(allocator, auth, args);
             }
+            fn relinquishOutput(p: *anyopaque, allocator: std.mem.Allocator, auth: types.AuthId, basket: []const u8, txid: []const u8, vout: u32) anyerror!u64 {
+                const self: Ptr = @ptrCast(@alignCast(p));
+                return self.relinquishOutput(allocator, auth, basket, txid, vout);
+            }
+            fn storeKeyShares(p: *anyopaque, allocator: std.mem.Allocator, auth: types.AuthId, shares: []const []const u8) anyerror!void {
+                const self: Ptr = @ptrCast(@alignCast(p));
+                return self.storeKeyShares(allocator, auth, shares);
+            }
+            fn loadKeyShares(p: *anyopaque, allocator: std.mem.Allocator, auth: types.AuthId) anyerror![][]u8 {
+                const self: Ptr = @ptrCast(@alignCast(p));
+                return self.loadKeyShares(allocator, auth);
+            }
             fn destroy(p: *anyopaque) void {
                 const self: Ptr = @ptrCast(@alignCast(p));
                 self.destroy();
@@ -114,6 +144,9 @@ pub const WalletStorageProvider = struct {
                 .listOutputs = impl.listOutputs,
                 .listActions = impl.listActions,
                 .internalizeAction = impl.internalizeAction,
+                .relinquishOutput = impl.relinquishOutput,
+                .storeKeyShares = impl.storeKeyShares,
+                .loadKeyShares = impl.loadKeyShares,
                 .destroy = impl.destroy,
             },
         };

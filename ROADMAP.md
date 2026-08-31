@@ -21,24 +21,29 @@ Implementation progress toward parity with [go-wallet-toolbox](https://github.co
 - [x] Signer types (`CreateActionArgs`, `SignActionArgs`, options)
 - [x] Signable data extraction and signed input construction
 - [x] HTTP client and JSON-RPC request/response handling
-- [x] E2e test against live `api.1sat.app`
+- [x] E2e test against live `api.1sat.app` services (soft network check; storage lifecycle runs locally by default, remote via `WALLET_STORAGE_URL`)
 
 ## Storage
 
-- [ ] Local storage provider (SQLite via C interop or custom file-backed store)
-- [ ] GORM-equivalent entity model (Output, Transaction, User, OutputBasket, TxNote, KnownTx)
+- [x] Local storage provider (in-memory HashMap via LocalStorageClient)
+- [x] SQLite-backed local storage provider (file persistence, WAL mode, concurrent + crash-recovery capable)
+- [x] Entity model (users, transactions, outputs, output baskets, labels, tags, known_txs, tx_notes, commissions, certificates, key_value) — schema + idempotent migrations
 - [ ] CRUD query builder with typed conditions, filters, pagination
 - [ ] Storage server (HTTP server hosting wallet storage for remote clients)
-- [ ] BEEF verification in storage layer
-- [ ] Script verification in storage layer
+- [x] BEEF verification in storage layer (internalizeAction: `spv.verifyBeef` ancestor walk + chain-tracked merkle roots via `ChaintracksChainTracker`; strict by default, per-call `trustUnverified` opt-out; fails closed without services)
+- [x] Script verification in storage layer (`spv.verifyScripts` on the internalized tx inputs; result reported as `scriptsVerified`)
 
 ## Monitor
 
-- [ ] Background monitor daemon
-- [ ] Rebroadcast failed/pending transactions
-- [ ] Chain reorganization handling
-- [ ] Merkle proof acquisition for confirmed transactions
-- [ ] Sync pending transaction statuses
+- [x] Background monitor (`monitor.Monitor` + `monitor.Daemon` loop) with Go-parity tasks:
+  - [x] checkForProofs (chain-verified merkle proof -> completed + proof/height recorded)
+  - [x] sendWaiting (broadcast aged unprocessed txs, per-tx attempt cap)
+  - [x] failAbandoned (stale unprocessed -> failed)
+  - [x] unfailChecker ('unfail' recheck: mined -> completed, known -> unprocessed, unknown -> failed)
+- [ ] Reorg handling (orphaned block hashes, re-proving)
+- [ ] External broadcaster SSE events (Arcade push instead of polling)
+- [ ] Lease locking for multi-daemon deployments
+- [ ] Per-transaction history notes
 
 ## Certificates
 
@@ -51,14 +56,14 @@ Implementation progress toward parity with [go-wallet-toolbox](https://github.co
 ## Key Management
 
 - [x] Protocol-based key derivation within wallet context (BRC-42/43)
-- [ ] `PrivilegedKeyManager` equivalent with Shamir secret sharing
-- [ ] Wallet-level encrypt/decrypt operations
+- [x] `PrivilegedKeyManager` equivalent with Shamir secret sharing (BRC-42 privileged key split into threshold shares via `bsvz.primitives.keyshares`, persisted in the `key_shares` SQLite table)
+- [x] Wallet-level encrypt/decrypt operations (privileged key → AES-GCM via `bsvz.primitives.symmetric`)
 
 ## Wallet API Completeness
 
-- [ ] `internalizeAction` (wired but untested)
-- [ ] `listFailedActions`
-- [ ] `relinquishOutput`
+- [x] `internalizeAction` (BEEF parse, outputs recorded, inputs marked spent, known_txs upsert; SQLite backend; tests)
+- [x] `listFailedActions` (spec-op label, wire-compatible with TS/Go; `unfail` transitions for Monitor recovery)
+- [x] `relinquishOutput` (clear basket membership; SQLite + remote RPC; tests)
 - [x] `getBalance` (sum spendable outputs)
 - [ ] `requestSyncChunk` / sync state management
 - [ ] Pending sign actions local repo
@@ -85,6 +90,6 @@ Implementation progress toward parity with [go-wallet-toolbox](https://github.co
 - [ ] OpenTelemetry tracing
 - [ ] Structured logging beyond `std.log.scoped`
 - [ ] Permissions manager (per-app, per-protocol access control)
-- [ ] MockChain for offline testing (mock mining, UTXO tracking, proof generation)
-- [ ] CI workflow (GitHub Actions)
+- [ ] Mock HTTP server for offline service tests (previous attempt was removed; rewrite against the Zig 0.16/0.17 `std.Io` API)
+- [x] CI workflow (GitHub Actions; Zig 0.16.0 + 0.17 master, both required)
 - [ ] Examples directory
